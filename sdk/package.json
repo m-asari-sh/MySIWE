@@ -1,0 +1,13 @@
+{
+  "name": "passwiser-logins-sdk",
+  "version": "1.0.0",
+  "description": "Passwiser SDK for handling authentication flows including Authorization Code Flow and Sign-in with Ethereum (SIWE)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "keywords": ["passwiser", "authentication", "siwe", "ethereum", "login"],
+  "license": "MIT",
+  "dependencies": {
+    "web3": "^1.8.2"
+  }
+}
