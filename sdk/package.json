@@ -8,6 +8,7 @@
   "keywords": ["passwiser", "authentication", "siwe", "ethereum", "login"],
   "license": "MIT",
   "dependencies": {
+    "@walletconnect/ethereum-provider": "^2.23.0",
     "web3": "^1.8.2"
   }
 }

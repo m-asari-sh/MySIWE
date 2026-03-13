@@ -1,4 +1,5 @@
 import Web3 from 'web3';
+import EthereumProvider from '@walletconnect/ethereum-provider';
 import { AuthConfig, AuthError, AuthResult, LoginFlow } from './types';
 
 declare global {
@@ -37,10 +38,15 @@ type EvmProvider = {
 
 type SiweNonceResponse = { nonce: string };
 type SiweMessageResponse = { message: string };
+type WalletConnectProvider = {
+  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
+  disconnect?: () => Promise<void>;
+};
 
 export class AuthProvider {
   private config: AuthConfig;
   private web3: Web3 | null = null;
+  private walletConnectProvider: WalletConnectProvider | null = null;
   private readonly ENDPOINTS = {
     TOKEN: '/connect/token',
     SIWE_NONCE: '/Account/Siwe/Nonce',
@@ -108,6 +114,8 @@ export class AuthProvider {
     switch (flow) {
       case LoginFlow.SIWE:
         return this.handleSiweLogin();
+      case LoginFlow.SIWE_WALLETCONNECT:
+        return this.handleWalletConnectSiweLogin();
       default:
         throw new AuthError(`Unsupported login flow: ${flow}`, 'UNSUPPORTED_FLOW');
     }
@@ -126,54 +134,37 @@ export class AuthProvider {
       const walletAddress = accounts[0];
       const chainId = (await window.ethereum!.request({ method: 'eth_chainId' })) as string;
 
-      const nonceResponse = await fetch(
-        `${this.config.baseUrl}${this.ENDPOINTS.SIWE_NONCE}?client_id=${this.config.clientId}&evm_wallet_address=${walletAddress}`,
-        { method: 'GET' }
-      );
-
-      if (!nonceResponse.ok) {
-        throw new AuthError('Failed to get nonce', 'NONCE_FAILED', nonceResponse.status);
-      }
-
-      const nonceData = (await nonceResponse.json()) as SiweNonceResponse;
-
-      const messageResponse = await fetch(
-        `${this.config.baseUrl}${this.ENDPOINTS.SIWE_MESSAGE}?client_id=${this.config.clientId}&nonce=${nonceData.nonce}`,
-        { method: 'GET' }
-      );
-
-      if (!messageResponse.ok) {
-        throw new AuthError('Failed to get message', 'MESSAGE_FAILED', messageResponse.status);
-      }
-
-      const messageData = (await messageResponse.json()) as SiweMessageResponse;
+      const nonceData = await this.fetchSiweNonce(walletAddress);
+      const messageData = await this.fetchSiweMessage(nonceData.nonce);
       const signature = await this.signMessageWithWeb3(messageData.message, walletAddress);
-
-      const tokenResponse = await fetch(`${this.config.baseUrl}${this.ENDPOINTS.TOKEN}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: new URLSearchParams({
-          grant_type: 'siwe',
-          client_id: this.config.clientId,
-          signature,
-          evm_wallet_address: walletAddress,
-          chain_id: chainId,
-          scope: this.config.scope,
-        }),
-      });
-
-      if (!tokenResponse.ok) {
-        throw new AuthError('Failed to get tokens', 'TOKEN_FAILED', tokenResponse.status);
-      }
-
-      return (await tokenResponse.json()) as AuthResult;
+      return this.exchangeSiweToken(signature, walletAddress, chainId);
     } catch (error) {
       if (error instanceof AuthError) {
         throw error;
       }
       throw new AuthError('SIWE login failed', 'SIWE_FAILED');
+    }
+  }
+
+  private async handleWalletConnectSiweLogin(): Promise<AuthResult> {
+    const provider = await this.initializeWalletConnectProvider();
+
+    try {
+      const accounts = (await provider.request({ method: 'eth_requestAccounts' })) as string[];
+      const walletAddress = accounts[0];
+      const chainIdResult = await provider.request({ method: 'eth_chainId' });
+      const chainId = typeof chainIdResult === 'number' ? `0x${chainIdResult.toString(16)}` : String(chainIdResult);
+
+      const nonceData = await this.fetchSiweNonce(walletAddress);
+      const messageData = await this.fetchSiweMessage(nonceData.nonce);
+      const signature = await this.signMessageWithWalletConnect(provider, messageData.message, walletAddress);
+
+      return this.exchangeSiweToken(signature, walletAddress, chainId);
+    } catch (error) {
+      if (error instanceof AuthError) {
+        throw error;
+      }
+      throw new AuthError('WalletConnect SIWE login failed', 'SIWE_WALLETCONNECT_FAILED');
     }
   }
 
@@ -224,5 +215,104 @@ export class AuthProvider {
     } catch {
       throw new AuthError('Failed to sign message', 'SIGN_FAILED');
     }
+  }
+
+  private async initializeWalletConnectProvider(): Promise<WalletConnectProvider> {
+    if (this.walletConnectProvider) {
+      return this.walletConnectProvider;
+    }
+
+    const projectId = this.config.walletConnectProjectId;
+    if (!projectId) {
+      throw new AuthError('WalletConnect project id is missing', 'WALLETCONNECT_PROJECT_ID_MISSING');
+    }
+
+    const chains = this.config.walletConnectChains?.length ? this.config.walletConnectChains : [1];
+
+    try {
+      this.walletConnectProvider = (await EthereumProvider.init({
+        projectId,
+        chains,
+        showQrModal: true,
+      })) as WalletConnectProvider;
+
+      return this.walletConnectProvider;
+    } catch {
+      throw new AuthError('Failed to initialize WalletConnect', 'WALLETCONNECT_INIT_FAILED');
+    }
+  }
+
+  private async signMessageWithWalletConnect(
+    provider: WalletConnectProvider,
+    message: string,
+    walletAddress: string
+  ): Promise<string> {
+    const messageHex = this.toHex(message);
+    try {
+      return (await provider.request({
+        method: 'personal_sign',
+        params: [messageHex, walletAddress],
+      })) as string;
+    } catch {
+      throw new AuthError('Failed to sign message with WalletConnect', 'WALLETCONNECT_SIGN_FAILED');
+    }
+  }
+
+  private toHex(value: string): string {
+    const bytes = new TextEncoder().encode(value);
+    let hex = '0x';
+    bytes.forEach((byte) => {
+      hex += byte.toString(16).padStart(2, '0');
+    });
+    return hex;
+  }
+
+  private async fetchSiweNonce(walletAddress: string): Promise<SiweNonceResponse> {
+    const nonceResponse = await fetch(
+      `${this.config.baseUrl}${this.ENDPOINTS.SIWE_NONCE}?client_id=${this.config.clientId}&evm_wallet_address=${walletAddress}`,
+      { method: 'GET' }
+    );
+
+    if (!nonceResponse.ok) {
+      throw new AuthError('Failed to get nonce', 'NONCE_FAILED', nonceResponse.status);
+    }
+
+    return (await nonceResponse.json()) as SiweNonceResponse;
+  }
+
+  private async fetchSiweMessage(nonce: string): Promise<SiweMessageResponse> {
+    const messageResponse = await fetch(
+      `${this.config.baseUrl}${this.ENDPOINTS.SIWE_MESSAGE}?client_id=${this.config.clientId}&nonce=${nonce}`,
+      { method: 'GET' }
+    );
+
+    if (!messageResponse.ok) {
+      throw new AuthError('Failed to get message', 'MESSAGE_FAILED', messageResponse.status);
+    }
+
+    return (await messageResponse.json()) as SiweMessageResponse;
+  }
+
+  private async exchangeSiweToken(signature: string, walletAddress: string, chainId: string): Promise<AuthResult> {
+    const tokenResponse = await fetch(`${this.config.baseUrl}${this.ENDPOINTS.TOKEN}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        grant_type: 'siwe',
+        client_id: this.config.clientId,
+        signature,
+        evm_wallet_address: walletAddress,
+        chain_id: chainId,
+        scope: this.config.scope,
+      }),
+    });
+
+    if (!tokenResponse.ok) {
+      throw new AuthError('Failed to get tokens', 'TOKEN_FAILED', tokenResponse.status);
+    }
+
+    return (await tokenResponse.json()) as AuthResult;
   }
 }

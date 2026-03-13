@@ -3,10 +3,13 @@ export interface AuthConfig {
   baseUrl: string;
   scope: string;
   redirectUri?: string;
+  walletConnectProjectId?: string;
+  walletConnectChains?: number[];
 }
 
 export enum LoginFlow {
-  SIWE = 'siwe'
+  SIWE = 'siwe',
+  SIWE_WALLETCONNECT = 'siwe_walletconnect',
 }
 
 export interface AuthResult {

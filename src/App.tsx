@@ -41,6 +41,8 @@ const sdk = new PasswiserLoginsSDK({
   clientId: authConfig.clientId,
   baseUrl: authConfig.baseUrl,
   scope: authConfig.scope,
+  walletConnectProjectId: authConfig.walletConnectProjectId,
+  walletConnectChains: authConfig.walletConnectChains,
   redirectUri: authConfig.redirectUri,
 });
 
@@ -65,6 +67,7 @@ function getMetaMaskDappUrl(): string {
 export default function App() {
   const [tokens, setTokens] = useState<AuthResult | null>(() => getStoredTokens());
   const [loading, setLoading] = useState(false);
+  const [loadingFlow, setLoadingFlow] = useState<LoginFlow | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const isMobileDevice = isMobile();
@@ -94,6 +97,7 @@ export default function App() {
     }
     setError(null);
     setLoading(true);
+    setLoadingFlow(LoginFlow.SIWE);
     try {
       const result = await sdk.login(LoginFlow.SIWE);
       saveTokens(result);
@@ -103,6 +107,24 @@ export default function App() {
       setError(message);
     } finally {
       setLoading(false);
+      setLoadingFlow(null);
+    }
+  };
+
+  const handleWalletConnectLogin = async () => {
+    setError(null);
+    setLoading(true);
+    setLoadingFlow(LoginFlow.SIWE_WALLETCONNECT);
+    try {
+      const result = await sdk.login(LoginFlow.SIWE_WALLETCONNECT);
+      saveTokens(result);
+      setTokens(result);
+    } catch (err: unknown) {
+      const message = err instanceof AuthError ? err.message : err instanceof Error ? err.message : 'Login failed';
+      setError(message);
+    } finally {
+      setLoading(false);
+      setLoadingFlow(null);
     }
   };
 
@@ -126,19 +148,32 @@ export default function App() {
               Connect your Ethereum wallet to sign in. Use MetaMask or another Web3 wallet.
             </p>
             {error && <div className="error" role="alert">{error}</div>}
-            <button
-              type="button"
-              className="btn btn-siwe"
-              onClick={handleSiweLogin}
-              disabled={loading}
-              aria-busy={loading}
-            >
-              {loading
-                ? 'Connecting…'
-                : shouldOpenInMetaMask
-                  ? 'Open in MetaMask to sign in'
-                  : 'Sign in with Ethereum'}
-            </button>
+            <div className="actions">
+              <button
+                type="button"
+                className="btn btn-siwe"
+                onClick={handleSiweLogin}
+                disabled={loading}
+                aria-busy={loadingFlow === LoginFlow.SIWE}
+              >
+                {loadingFlow === LoginFlow.SIWE
+                  ? 'Connecting…'
+                  : shouldOpenInMetaMask
+                    ? 'Open in MetaMask to sign in'
+                    : 'Sign in with Ethereum'}
+              </button>
+              <button
+                type="button"
+                className="btn btn-walletconnect"
+                onClick={handleWalletConnectLogin}
+                disabled={loading}
+                aria-busy={loadingFlow === LoginFlow.SIWE_WALLETCONNECT}
+              >
+                {loadingFlow === LoginFlow.SIWE_WALLETCONNECT
+                  ? 'Connecting WalletConnect…'
+                  : 'Sign in with WalletConnect'}
+              </button>
+            </div>
             {shouldOpenInMetaMask && (
               <p className="hint">
                 This will open the MetaMask app with this page. Then tap “Sign in with Ethereum” there.
