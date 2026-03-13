@@ -40,6 +40,9 @@ type SiweNonceResponse = { nonce: string };
 type SiweMessageResponse = { message: string };
 type WalletConnectProvider = {
   request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
+  connect?: (options?: { optionalChains?: number[]; chains?: number[] }) => Promise<unknown>;
+  accounts?: string[];
+  session?: unknown;
   disconnect?: () => Promise<void>;
 };
 
@@ -148,9 +151,13 @@ export class AuthProvider {
 
   private async handleWalletConnectSiweLogin(): Promise<AuthResult> {
     const provider = await this.initializeWalletConnectProvider();
+    await this.ensureWalletConnectConnected(provider);
 
     try {
       const accounts = (await provider.request({ method: 'eth_requestAccounts' })) as string[];
+      if (!accounts?.length) {
+        throw new AuthError('No wallet account returned by WalletConnect', 'WALLETCONNECT_NO_ACCOUNT');
+      }
       const walletAddress = accounts[0];
       const chainIdResult = await provider.request({ method: 'eth_chainId' });
       const chainId = typeof chainIdResult === 'number' ? `0x${chainIdResult.toString(16)}` : String(chainIdResult);
@@ -164,7 +171,10 @@ export class AuthProvider {
       if (error instanceof AuthError) {
         throw error;
       }
-      throw new AuthError('WalletConnect SIWE login failed', 'SIWE_WALLETCONNECT_FAILED');
+      throw new AuthError(
+        `WalletConnect SIWE login failed: ${this.getErrorMessage(error)}`,
+        'SIWE_WALLETCONNECT_FAILED'
+      );
     }
   }
 
@@ -228,17 +238,47 @@ export class AuthProvider {
     }
 
     const chains = this.config.walletConnectChains?.length ? this.config.walletConnectChains : [1];
+    const optionalChains = chains as [number, ...number[]];
 
     try {
       this.walletConnectProvider = (await EthereumProvider.init({
         projectId,
         chains,
+        optionalChains,
         showQrModal: true,
       })) as WalletConnectProvider;
 
       return this.walletConnectProvider;
-    } catch {
-      throw new AuthError('Failed to initialize WalletConnect', 'WALLETCONNECT_INIT_FAILED');
+    } catch (error) {
+      throw new AuthError(
+        `Failed to initialize WalletConnect: ${this.getErrorMessage(error)}`,
+        'WALLETCONNECT_INIT_FAILED'
+      );
+    }
+  }
+
+  private async ensureWalletConnectConnected(provider: WalletConnectProvider): Promise<void> {
+    const hasSession = Boolean(provider.session);
+    const hasAccounts = Array.isArray(provider.accounts) && provider.accounts.length > 0;
+    if (hasSession || hasAccounts) {
+      return;
+    }
+
+    if (!provider.connect) {
+      throw new AuthError(
+        'WalletConnect provider does not support connect()',
+        'WALLETCONNECT_CONNECT_UNSUPPORTED'
+      );
+    }
+
+    const chains = this.config.walletConnectChains?.length ? this.config.walletConnectChains : [1];
+    try {
+      await provider.connect({ optionalChains: chains, chains });
+    } catch (error) {
+      throw new AuthError(
+        `Failed to connect WalletConnect session: ${this.getErrorMessage(error)}`,
+        'WALLETCONNECT_CONNECT_FAILED'
+      );
     }
   }
 
@@ -248,14 +288,29 @@ export class AuthProvider {
     walletAddress: string
   ): Promise<string> {
     const messageHex = this.toHex(message);
-    try {
-      return (await provider.request({
-        method: 'personal_sign',
-        params: [messageHex, walletAddress],
-      })) as string;
-    } catch {
-      throw new AuthError('Failed to sign message with WalletConnect', 'WALLETCONNECT_SIGN_FAILED');
+    const attempts: Array<unknown[]> = [
+      [messageHex, walletAddress],
+      [walletAddress, messageHex],
+      [message, walletAddress],
+    ];
+
+    for (let i = 0; i < attempts.length; i += 1) {
+      try {
+        return (await provider.request({
+          method: 'personal_sign',
+          params: attempts[i],
+        })) as string;
+      } catch (error) {
+        if (i === attempts.length - 1) {
+          throw new AuthError(
+            `Failed to sign message with WalletConnect: ${this.getErrorMessage(error)}`,
+            'WALLETCONNECT_SIGN_FAILED'
+          );
+        }
+      }
     }
+
+    throw new AuthError('Failed to sign message with WalletConnect', 'WALLETCONNECT_SIGN_FAILED');
   }
 
   private toHex(value: string): string {
@@ -265,6 +320,16 @@ export class AuthProvider {
       hex += byte.toString(16).padStart(2, '0');
     });
     return hex;
+  }
+
+  private getErrorMessage(error: unknown): string {
+    if (error instanceof Error && error.message) {
+      return error.message;
+    }
+    if (typeof error === 'string' && error.trim()) {
+      return error;
+    }
+    return 'Unknown error';
   }
 
   private async fetchSiweNonce(walletAddress: string): Promise<SiweNonceResponse> {
